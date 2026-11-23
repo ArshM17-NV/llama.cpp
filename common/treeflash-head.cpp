@@ -131,11 +131,40 @@ void common_treeflash_history::observe_logits(llama_token parent, const float * 
         // Sum the whole row only if that interval could change which top-eight token survives.
         int count = keep(top_mass);
         if (count != keep(top_mass + (n_vocab - 8)*double(weights.back()))) {
-            double total = 0;
+            // Group the remaining logits by distance from the peak. Each bin's
+            // endpoint weights bound its contribution without exponentiating each token.
+            static constexpr int bins_per_logit = 16, last_bin = 32 * bins_per_logit;
+            static const auto edges = [] {
+                std::array<float, last_bin + 2> result{}; // last bin extends to -infinity
+                for (int b = 0; b <= last_bin; ++b) {
+                    result[b] = std::exp(-float(b) / bins_per_logit);
+                }
+                return result;
+            }();
+            auto bin = [&](float x) { return int(std::min(float(last_bin), (values[0] - x) * bins_per_logit)); };
+            std::array<int32_t, last_bin + 1> counts{};
             for (int32_t i = 0; i < n_vocab; ++i) {
-                total += std::exp(logits[i] - values[0]);
+                ++counts[bin(logits[i])];
             }
-            count = keep(total);
+            for (float x : values) {
+                --counts[bin(x)]; // top_mass already includes these exact weights
+            }
+            double low = top_mass, high = top_mass;
+            for (int b = 0; b <= last_bin; ++b) {
+                low  += counts[b] * double(edges[b + 1]);
+                high += counts[b] * double(edges[b]);
+            }
+            // Include float exp rounding and worst-case roundoff in the double row sum.
+            const double pad = high * (2 * std::numeric_limits<float>::epsilon() +
+                                       2.0 * n_vocab * std::numeric_limits<double>::epsilon());
+            count = keep(low - pad);
+            if (count != keep(high + pad)) {
+                double total = 0;
+                for (int32_t i = 0; i < n_vocab; ++i) {
+                    total += std::exp(logits[i] - values[0]);
+                }
+                count = keep(total);
+            }
         }
         std::fill(weights.begin() + count, weights.end(), 0.0f);
     }

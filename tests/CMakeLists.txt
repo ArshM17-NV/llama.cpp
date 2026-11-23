@@ -370,6 +370,7 @@ llama_build_and_test(test-backend-tensor.cpp LINK ggml)
 llama_build_and_test(test-sleep.cpp LINK ggml)
 llama_build_and_test(test-backend-sched.cpp LINK ggml)
 llama_build_and_test(test-draft-shortlist.cpp LABEL "behavior backend" LINK ggml)
+llama_build_and_test(test-treeflash-history.cpp LABEL behavior)
 
 if (BUILD_SHARED_LIBS)
     llama_build_and_test(test-llama-mmap.cpp ${PROJECT_SOURCE_DIR}/src/llama-impl.cpp ${PROJECT_SOURCE_DIR}/src/llama-mmap.cpp LABEL behavior)

@@ -508,6 +508,27 @@ struct case_tree_verify : ctx_test {
         auto serial = mr.ctx(opts);
         CTX_REQUIRE(tree && serial, "context initialization failed");
 
+        // Present an ordinary causal batch of the same size. Its prefix is the
+        // independent root-to-node chain. Future padding cannot affect that
+        // prefix and is removed with the normal recurrent rollback mechanism.
+        // Matching the matmul shapes avoids comparing different CUDA precisions.
+        auto ordinary_chain = [&](int root, const int32_t * parents, int count, int accepted) {
+            std::vector<int> path;
+            for (int node = accepted; node >= 0; node = parents[node]) {
+                path.push_back(node);
+            }
+            common_batch batch(serial.get());
+            for (int row = 0; row < count; ++row) {
+                const int token_index = row < (int) path.size() ? path[path.size()-1-row] : count+row;
+                batch.add(gen_token(n_vocab, 0, root+token_index), root+row, 0, true);
+            }
+            if (llama_process(serial.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get()) != 0 ||
+                    !llama_memory_seq_rm(llama_get_memory(serial.get()), 0, root+(int)path.size(), -1)) {
+                return -1;
+            }
+            return (int) path.size() - 1;
+        };
+
         // Includes siblings with different subtrees and noncontiguous accepted paths.
         const int parents[][8] = {{-1,0,1,0,3,2,3,5}, {-1,0,0,2,1,2,4,6}};
         for (const auto & parent : parents) {
@@ -522,19 +543,16 @@ struct case_tree_verify : ctx_test {
                     batch.add(gen_token(n_vocab, 0, prefix+i), prefix+i, 0, true);
                 }
                 CTX_REQUIRE(llama_decode_tree(tree.get(), batch.get(), parent) == 0, "tree decode failed");
-                std::vector<int> path;
-                for (int i = accepted; i >= 0; i = parent[i]) {
-                    path.push_back(i);
-                }
-                int position = prefix;
-                for (auto it = path.rbegin(); it != path.rend(); ++it) {
-                    CTX_REQUIRE(decode_one(serial.get(), gen_token(n_vocab, 0, prefix+*it), position++), "chain decode failed");
-                }
-                auto compare = [&](int node) {
-                    return compare_logits(llama_get_logits_ith(serial.get(), -1),
-                                         llama_get_logits_ith(tree.get(), node), n_vocab).nmse() <= NMSE_THRESHOLD;
+                const int chain_row = ordinary_chain(prefix, parent, 8, accepted);
+                CTX_REQUIRE(chain_row >= 0, "ordinary causal chain failed");
+                int position = prefix + chain_row + 1;
+                auto compare = [&](int node, int reference) {
+                    return compare_logits(llama_get_logits_ith(serial.get(), reference),
+                                         llama_get_logits_ith(tree.get(), node), n_vocab).nmse();
                 };
-                CTX_REQUIRE(compare(accepted), "tree logits differ at node " + std::to_string(accepted));
+                const double nmse = compare(accepted, chain_row);
+                CTX_REQUIRE(nmse <= NMSE_THRESHOLD, "tree logits differ at node " + std::to_string(accepted) +
+                            ", NMSE = " + std::to_string(nmse));
                 CTX_REQUIRE(llama_tree_commit(tree.get(), accepted) == 0, "tree commit failed");
                 CTX_REQUIRE(llama_memory_seq_pos_max(llama_get_memory(tree.get()), 0) == position-1, "wrong committed position");
                 // The server trims speculation after the verifier commits. It must
@@ -552,7 +570,7 @@ struct case_tree_verify : ctx_test {
                     const auto token = gen_token(n_vocab, 0, 20+i);
                     CTX_REQUIRE(decode_one(tree.get(), token, position) && decode_one(serial.get(), token, position),
                                 "post-commit decode failed");
-                    CTX_REQUIRE(compare(-1), "post-commit logits differ at node " + std::to_string(accepted));
+                    CTX_REQUIRE(compare(-1, -1) <= NMSE_THRESHOLD, "post-commit logits differ at node " + std::to_string(accepted));
                     ++position;
                 }
             }
@@ -574,14 +592,10 @@ struct case_tree_verify : ctx_test {
             }
             CTX_REQUIRE(llama_decode_tree(tree.get(), batch.get(), parent.data()) == 0, "consecutive tree decode failed");
             int accepted = (int) parent.size() / 2;
-            std::vector<llama_token> path;
-            for (int node = accepted; node >= 0; node = parent[node]) {
-                path.push_back(gen_token(n_vocab, 0, position+node));
-            }
-            for (auto it = path.rbegin(); it != path.rend(); ++it) {
-                CTX_REQUIRE(decode_one(serial.get(), *it, position++), "consecutive serial decode failed");
-            }
-            CTX_REQUIRE(compare_logits(llama_get_logits_ith(serial.get(), -1), llama_get_logits_ith(tree.get(), accepted),
+            const int chain_row = ordinary_chain(position, parent.data(), (int) parent.size(), accepted);
+            CTX_REQUIRE(chain_row >= 0, "consecutive ordinary chain failed");
+            position += chain_row + 1;
+            CTX_REQUIRE(compare_logits(llama_get_logits_ith(serial.get(), chain_row), llama_get_logits_ith(tree.get(), accepted),
                         n_vocab).nmse() <= NMSE_THRESHOLD, "consecutive tree logits differ");
             CTX_REQUIRE(llama_tree_commit(tree.get(), accepted) == 0, "consecutive tree commit failed");
         }

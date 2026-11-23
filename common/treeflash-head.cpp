@@ -95,6 +95,40 @@ void common_treeflash_history::observe(llama_token parent, const llama_token * i
     std::copy_n(probabilities8, 8, r.verifier_p.begin());
 }
 
+bool common_treeflash_history::observe_backend(llama_token parent, const llama_tree_history_row & row, int32_t n_vocab, float top_p) {
+    std::array<int, 9> order{0, 1, 2, 3, 4, 5, 6, 7, 8};
+    std::sort(order.begin(), order.end(), [&](int a, int b) {
+        return row.logits[a] == row.logits[b] ? row.ids[a] < row.ids[b] : row.logits[a] > row.logits[b];
+    });
+    if (row.logits[order[7]] == row.logits[order[8]]) {
+        return false; // backend top-k may retain any subset of the boundary tie
+    }
+    // Bound float summation roundoff, plus cross-backend exp and division rounding.
+    const double nu = (n_vocab + 16.0) * std::numeric_limits<float>::epsilon() / 2;
+    const double guard = nu < 1 ? 2 * nu / (1 - nu) : 1;
+    std::array<llama_token, 8> ids;
+    std::array<float, 8> weights{};
+    int keep = 8;
+    double mass = 0;
+    for (int i = 0; i < 8; ++i) {
+        const int j = order[i];
+        ids[i] = llama_token(row.ids[j]);
+        weights[i] = std::exp(row.logits[j] - row.logits[order[0]]);
+        if (top_p > 0 && top_p < 1 && i < 7 && keep == 8) {
+            mass += row.probabilities[j];
+            if (std::abs(mass - top_p) <= guard * mass) {
+                return false; // resolve an ambiguous prefix with the CPU reference
+            }
+            if (mass >= top_p) {
+                keep = i + 1;
+            }
+        }
+    }
+    std::fill(weights.begin() + (top_p <= 0 ? 1 : keep), weights.end(), 0.0f);
+    observe(parent, ids.data(), weights.data());
+    return true;
+}
+
 void common_treeflash_history::observe_logits(llama_token parent, const float * logits, int32_t n_vocab, float top_p) {
     if (n_vocab < 8) {
         throw std::invalid_argument("TreeFlash requires at least eight verifier logits");

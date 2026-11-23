@@ -1817,16 +1817,19 @@ struct common_speculative_impl_treeflash final : common_speculative_impl_draft_d
                 llama_n_ubatch(params.ctx_tgt) < head_t::nodes || llama_n_ubatch(params.ctx_dft) < head_t::nodes) {
             throw std::runtime_error("TreeFlash requires one slot, a matching eight-row drafter and head, and eight-row microbatches");
         }
+        const char * backend_history = std::getenv("LLAMA_TREEFLASH_BACKEND_HISTORY");
         params.n_max = head_t::depth;
         init({head_t::depth, false, true, false});
         if (!llama_set_draft_shortlist(params.ctx_dft, head_t::top_k)) {
             throw std::runtime_error("TreeFlash requires a LiLiCorr draft context that can return its candidate shortlist");
         }
+        llama_set_tree_history(params.ctx_tgt, backend_history && std::strcmp(backend_history, "1") == 0);
         LOG_INF("%s: TreeFlash enabled (depth %d, %d candidates, %d verifier rows)\n",
                 __func__, head_t::depth, head_t::top_k, head_t::nodes);
     }
 
     ~common_speculative_impl_treeflash() override {
+        llama_set_tree_history(params.ctx_tgt, false);
         llama_set_draft_shortlist(params.ctx_dft, 0);
     }
 
@@ -1900,8 +1903,17 @@ struct common_speculative_impl_treeflash final : common_speculative_impl_draft_d
             accepted.add(node.token, root_pos + node.depth, seq, false);
             words.push_back(node.token);
         }
+        const auto * packed = llama_get_tree_history(params.ctx_tgt);
+        const float * fallback = nullptr;
         for (size_t i = 0; i < tree.size(); ++i) {
-            history.observe_logits(tree[i].token, llama_get_logits_ith(params.ctx_tgt, int32_t(i)), head.vocab_size(), top_p);
+            if (!packed) {
+                history.observe_logits(tree[i].token, llama_get_logits_ith(params.ctx_tgt, int32_t(i)), head.vocab_size(), top_p);
+            } else if (!history.observe_backend(tree[i].token, packed[i], head.vocab_size(), top_p)) {
+                if (!fallback) {
+                    fallback = llama_get_logits(params.ctx_tgt);
+                }
+                history.observe_logits(tree[i].token, fallback + i*head.vocab_size(), head.vocab_size(), top_p);
+            }
         }
         words.push_back(bonus);
         history.commit(words);

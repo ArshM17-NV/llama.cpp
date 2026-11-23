@@ -1,4 +1,5 @@
 #include "llama-graph.h"
+#include "models/tree-history.h"
 
 #include "llama-impl.h"
 #include "llama-model.h"
@@ -1564,6 +1565,7 @@ void llm_graph_result::reset() {
     t_inp_tokens  = nullptr;
     t_inp_embd    = nullptr;
     t_logits      = nullptr;
+    t_tree_history = nullptr;
     t_embd        = nullptr;
     t_embd_pooled = nullptr;
     t_h_nextn     = nullptr;
@@ -1609,6 +1611,9 @@ void llm_graph_result::set_inputs(const llama_ubatch * ubatch) {
 }
 
 void llm_graph_result::set_outputs(const llm_graph_params & params) {
+    if (t_tree_history) {
+        ggml_set_output(t_tree_history);
+    }
     if (t_logits != nullptr) {
         ggml_set_output(t_logits);
     }
@@ -4583,6 +4588,10 @@ void llm_graph_context::build_logits() const {
     // the models declare t_logits without expanding it, so the LM head is computed only when it is expanded here
     if (res->t_logits != nullptr) {
         ggml_build_forward_expand(gf, res->t_logits);
+        if (ubatch.tree_history) {
+            res->t_tree_history = llama_tree_history_candidates(ctx0, res->t_logits);
+            ggml_build_forward_expand(gf, res->t_tree_history);
+        }
     }
 }
 

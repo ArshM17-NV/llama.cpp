@@ -897,6 +897,7 @@ struct llm_graph_params {
         // first check the ubatch
         bool can_reuse_ubatch =
             bool(ubatch.tree)   == bool(other.ubatch.tree) &&
+            ubatch.tree_history == other.ubatch.tree_history &&
             ubatch.equal_seqs() == other.ubatch.equal_seqs() &&
             ubatch.n_tokens     == other.ubatch.n_tokens &&
             ubatch.n_seq_tokens == other.ubatch.n_seq_tokens &&
@@ -987,6 +988,7 @@ public:
     virtual ~llm_graph_result() = default;
 
     ggml_tensor * get_inp_tokens()  const { return t_inp_tokens; }
+    ggml_tensor * get_tree_history() const { return t_tree_history; }
     ggml_tensor * get_logits()      const { return t_logits; }
     ggml_tensor * get_embd()        const { return t_embd; }
     ggml_tensor * get_embd_pooled() const { return t_embd_pooled; }
@@ -1029,6 +1031,7 @@ public:
     ggml_tensor * t_inp_tokens  = nullptr;
     ggml_tensor * t_inp_embd    = nullptr; // [n_embd_inp, n_tokens]
     ggml_tensor * t_logits      = nullptr;
+    ggml_tensor * t_tree_history = nullptr;
     ggml_tensor * t_embd        = nullptr;
     ggml_tensor * t_embd_pooled = nullptr;
     ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm

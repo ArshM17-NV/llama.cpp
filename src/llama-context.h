@@ -165,6 +165,8 @@ struct llama_context {
     int decode(const llama_batch_ext & batch_inp, const std::shared_ptr<const llama_tree_batch> & tree = nullptr);
     int decode_tree(const llama_batch_ext & batch, const int32_t * parents);
     int commit_tree(int accepted);
+    void set_tree_history(bool enabled) { tree_history_enabled = enabled; }
+    const llama_tree_history_row * get_tree_history();
 
     // compat version
     int encode(const llama_batch & batch_inp);
@@ -245,6 +247,9 @@ struct llama_context {
 
 private:
     std::shared_ptr<const llama_tree_batch> pending_tree;
+    bool tree_history_enabled = false;
+    bool tree_history_ready = false;
+    std::array<llama_tree_history_row, llama_tree_batch::max_nodes> tree_history_rows;
     //
     // output
     //

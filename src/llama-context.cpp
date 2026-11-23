@@ -1899,6 +1899,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 }
 
 int llama_context::encode(const llama_batch_ext & batch_inp) {
+    tree_history_ready = false;
     if (batch_inp.tokens.empty()) {
         LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
         return -1;
@@ -2189,6 +2190,15 @@ int llama_context::decode_tree(const llama_batch_ext & batch, const int32_t * pa
     return ret;
 }
 
+const llama_tree_history_row * llama_context::get_tree_history() {
+    if (!tree_history_ready) {
+        return nullptr;
+    }
+    synchronize();
+    output_reorder();
+    return tree_history_rows.data();
+}
+
 int llama_context::commit_tree(int accepted) {
     if (!pending_tree || accepted < 0 || accepted >= pending_tree->n_nodes) {
         return -1;
@@ -2202,6 +2212,7 @@ int llama_context::commit_tree(int accepted) {
 }
 
 int llama_context::decode(const llama_batch_ext & batch_inp, const std::shared_ptr<const llama_tree_batch> & tree) {
+    tree_history_ready = false;
     if (pending_tree) {
         LLAMA_LOG_ERROR("%s: commit the previous tree before decoding again\n", __func__);
         return -1;
@@ -2411,8 +2422,10 @@ int llama_context::decode(const llama_batch_ext & batch_inp, const std::shared_p
         ggml_backend_event_wait(h_nextn_backend, ev_h_nextn_read.get());
     }
 
+    bool copied_tree_history = false;
     do {
         auto ubatch = mctx->get_ubatch();
+        ubatch.tree_history = tree && tree_history_enabled && n_vocab >= 9 && n_vocab <= (1u << 24);
         if (tree && tree->depth[tree->n_nodes - 1] != tree->n_nodes - 1) {
             GGML_ASSERT(ubatch.n_tokens == (uint32_t) tree->n_nodes && ubatch.n_seqs == 1);
             ubatch.tree = tree;
@@ -2480,6 +2493,15 @@ int llama_context::decode(const llama_batch_ext & batch_inp, const std::shared_p
 
         if (t_embd && res->get_embd_pooled()) {
             t_embd = res->get_embd_pooled();
+        }
+
+        if (auto * compact = res->get_tree_history()) {
+            static_assert(sizeof(llama_tree_history_row) == 27 * sizeof(float), "packed history layout");
+            GGML_ASSERT(n_outputs_prev + n_outputs <= int64_t(tree_history_rows.size()));
+            GGML_ASSERT(ggml_nbytes(compact) == n_outputs * sizeof(llama_tree_history_row));
+            auto * backend = ggml_backend_sched_get_tensor_backend(sched.get(), compact);
+            ggml_backend_tensor_get_async(backend, compact, tree_history_rows.data() + n_outputs_prev, 0, ggml_nbytes(compact));
+            copied_tree_history = true;
         }
 
         // extract logits
@@ -2626,6 +2648,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp, const std::shared_p
         }
     }
 
+    tree_history_ready = copied_tree_history;
     // set to total number of outputs in the batch, for use in llama_get_logits_ith
     n_outputs = n_outputs_all;
 
@@ -2892,6 +2915,9 @@ void llama_context::output_reorder() {
     for (size_t s = 0; s < output_swaps.size(); ++s) {
         const uint64_t i0 = output_swaps[s].i0;
         const uint64_t i1 = output_swaps[s].i1;
+        if (tree_history_ready) {
+            std::swap(tree_history_rows[i0], tree_history_rows[i1]);
+        }
 
         if (logits.size > 0) {
             for (uint64_t k = 0; k < n_vocab; k++) {
@@ -5132,6 +5158,14 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
 int32_t llama_decode_tree(llama_context * ctx, const llama_batch_ext * batch, const int32_t * parents) {
     return ctx && batch ? ctx->decode_tree(*batch, parents) : -1;
+}
+
+void llama_set_tree_history(llama_context * ctx, bool enabled) {
+    ctx->set_tree_history(enabled);
+}
+
+const llama_tree_history_row * llama_get_tree_history(llama_context * ctx) {
+    return ctx->get_tree_history();
 }
 
 int32_t llama_tree_commit(llama_context * ctx, int32_t accepted_node) {

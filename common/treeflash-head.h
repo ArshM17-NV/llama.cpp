@@ -21,6 +21,7 @@ public:
     // Include the pending root after the prompt. commit() takes root, matches, then the bonus.
     void reset(const std::vector<llama_token> & prompt);
     void commit(const std::vector<llama_token> & tokens);
+    bool observe_backend(llama_token parent, const llama_tree_history_row & row, int32_t n_vocab, float top_p);
     void observe_logits(llama_token parent, const float * logits, int32_t n_vocab, float top_p);
     void observe(llama_token parent, const llama_token * ids8, const float * probabilities8);
     void features(llama_token parent, const llama_token * ids20, float * out20) const;

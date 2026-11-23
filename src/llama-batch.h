@@ -98,6 +98,7 @@ struct llama_ubatch {
     // the llama_ubatch pointers above point to this data if set. otherwise - point to external non-owning data
     std::shared_ptr<data_t> data;
     std::shared_ptr<const llama_tree_batch> tree = nullptr;
+    bool tree_history = false; // includes all-linear verification batches
 };
 
 // crash if a mixed ubatch reaches code that expects only tokens or only embd

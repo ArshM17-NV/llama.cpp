@@ -1110,6 +1110,16 @@ extern "C" {
     // before the next decode; accepted_node=0 keeps only the root input.
     LLAMA_API int32_t llama_decode_tree(struct llama_context * ctx,
                                        const struct llama_batch_ext * batch, const int32_t * parents);
+    // One verification row, nine unordered candidates. The ninth detects ties at the top-eight cutoff.
+    struct llama_tree_history_row {
+        float ids[9];
+        float logits[9];
+        float probabilities[9]; // normalized over the entire vocabulary
+    };
+    LLAMA_API void llama_set_tree_history(struct llama_context * ctx, bool enabled);
+    // Rows are in batch order, valid through commit and until the next decode or encode.
+    LLAMA_API const struct llama_tree_history_row * llama_get_tree_history(struct llama_context * ctx);
+
     LLAMA_API int32_t llama_tree_commit(struct llama_context * ctx, int32_t accepted_node);
 
     // Set the number of threads used for decoding

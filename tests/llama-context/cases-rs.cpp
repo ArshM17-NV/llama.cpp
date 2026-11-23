@@ -585,7 +585,11 @@ struct case_tree_verify : ctx_test {
         llama_memory_clear(llama_get_memory(tree.get()), true);
         llama_memory_clear(llama_get_memory(serial.get()), true);
         int position = 0;
+        llama_set_tree_history(serial.get(), true); // ordinary batches must still expose no shortlist
+        int round_index = 0;
         for (const auto & parent : rounds) {
+            const bool enabled = round_index++ != 1;
+            llama_set_tree_history(tree.get(), enabled);
             common_batch batch(tree.get());
             for (int node = 0; node < (int) parent.size(); ++node) {
                 batch.add(gen_token(n_vocab, 0, position+node), position+node, 0, true);
@@ -598,6 +602,21 @@ struct case_tree_verify : ctx_test {
             CTX_REQUIRE(compare_logits(llama_get_logits_ith(serial.get(), chain_row), llama_get_logits_ith(tree.get(), accepted),
                         n_vocab).nmse() <= NMSE_THRESHOLD, "consecutive tree logits differ");
             CTX_REQUIRE(llama_tree_commit(tree.get(), accepted) == 0, "consecutive tree commit failed");
+            CTX_REQUIRE(llama_get_tree_history(serial.get()) == nullptr, "ordinary batch produced history");
+            const auto * rows = llama_get_tree_history(tree.get());
+            CTX_REQUIRE((rows != nullptr) == (enabled && n_vocab >= 9 && n_vocab <= (1 << 24)), "history enable mismatch");
+            for (int i = 0; rows && i < (int) parent.size(); ++i) {
+                const float * logits = llama_get_logits_ith(tree.get(), i);
+                const float peak = *std::max_element(logits, logits + n_vocab);
+                double total = 0;
+                for (int id = 0; id < n_vocab; ++id) { total += std::exp(logits[id] - peak); }
+                for (int rank = 0; rank < 9; ++rank) {
+                    const int id = (int) rows[i].ids[rank];
+                    CTX_REQUIRE(id >= 0 && id < n_vocab && rows[i].logits[rank] == logits[id], "packed ID/logit mismatch");
+                    const double p = std::exp(logits[id] - peak) / total;
+                    CTX_REQUIRE(std::abs(rows[i].probabilities[rank] - p) < 2e-7 + 2e-5 * p, "packed probability mismatch");
+                }
+            }
         }
         return case_result::pass();
     }

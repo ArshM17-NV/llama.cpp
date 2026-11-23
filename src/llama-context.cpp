@@ -2426,7 +2426,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp, const std::shared_p
     do {
         auto ubatch = mctx->get_ubatch();
         ubatch.tree_history = tree && tree_history_enabled && n_vocab >= 9 && n_vocab <= (1u << 24);
-        if (tree && tree->depth[tree->n_nodes - 1] != tree->n_nodes - 1) {
+        // Full-width proposals share a graph as their parent table changes between chains and branches.
+        if (tree && (tree->n_nodes == llama_tree_batch::max_nodes || tree->depth[tree->n_nodes - 1] != tree->n_nodes - 1)) {
             GGML_ASSERT(ubatch.n_tokens == (uint32_t) tree->n_nodes && ubatch.n_seqs == 1);
             ubatch.tree = tree;
         }

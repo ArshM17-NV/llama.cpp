@@ -530,7 +530,7 @@ struct case_tree_verify : ctx_test {
         };
 
         // Includes siblings with different subtrees and noncontiguous accepted paths.
-        const int parents[][8] = {{-1,0,1,0,3,2,3,5}, {-1,0,0,2,1,2,4,6}};
+        const int parents[][8] = {{-1,0,1,0,3,2,3,5}, {-1,0,0,2,1,2,4,6}, {-1,0,1,2,3,4,5,6}};
         for (const auto & parent : parents) {
             for (int accepted = 0; accepted < 8; ++accepted) {
                 llama_memory_clear(llama_get_memory(tree.get()), true);
@@ -579,7 +579,8 @@ struct case_tree_verify : ctx_test {
         // Consecutive tree forwards reuse a graph while changing its parent table.
         // Also alternate with a truncated tree and a chain, as near a request limit.
         const std::vector<std::vector<int32_t>> rounds = {
-            {-1,0,1,0,3,2,3,5}, {-1,0,0,2,1,2,4,6}, {-1,0,1,1,0},
+            {-1,0,1,0,3,2,3,5}, {-1,0,0,2,1,2,4,6},
+            {-1,0,1,0,3,2,3,5}, {-1,0,1,2,3,4,5,6}, {-1,0,0,2,1,2,4,6}, {-1,0,1,1,0},
             {-1,0,1,2}, {-1,0,0}, {-1},
         };
         llama_memory_clear(llama_get_memory(tree.get()), true);

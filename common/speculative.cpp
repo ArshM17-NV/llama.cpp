@@ -1823,7 +1823,7 @@ struct common_speculative_impl_treeflash final : common_speculative_impl_draft_d
         if (!llama_set_draft_shortlist(params.ctx_dft, head_t::top_k)) {
             throw std::runtime_error("TreeFlash requires a LiLiCorr draft context that can return its candidate shortlist");
         }
-        llama_set_tree_history(params.ctx_tgt, backend_history && std::strcmp(backend_history, "1") == 0);
+        llama_set_tree_history(params.ctx_tgt, !backend_history || std::strcmp(backend_history, "0") != 0);
         LOG_INF("%s: TreeFlash enabled (depth %d, %d candidates, %d verifier rows)\n",
                 __func__, head_t::depth, head_t::top_k, head_t::nodes);
     }

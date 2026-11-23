@@ -185,12 +185,19 @@ llama-server -m target.gguf -md LiLiCorr.gguf --spec-type draft-lilicorr \
 ```
 
 This path supports one server slot, a compatible eight-row LiLiCorr draft and a
-hybrid target with recurrent snapshots. Set the microbatch size to at least eight.
+Nemotron-H or Nemotron-H-MoE target with recurrent snapshots. Set the microbatch
+size to at least eight. The target backend extracts the most likely verifier
+tokens for the head's request history. Set `LLAMA_TREEFLASH_BACKEND_HISTORY=0`
+to compute this history from the raw logits on the host.
 At temperature 1 with the standard distribution sampler the proposer and target
 share position- and token-specific Gumbel noise. This helps the tree cover likely
 stochastic continuations. A fixed seed can produce different text from the stock
 sampler. At other temperatures the target uses its usual sampler. To benchmark
 the stock LiLiCorr chain, use the same server command and omit `--spec-tree-head`.
+
+Verification uses the target's logits at each node. On quantized Bolt, the
+arithmetic of a batched tree and single-token decoding can differ enough to
+change a greedy choice, so exact token sequences can also differ at temperature zero.
 
 ### n-gram Cache (`ngram-cache`)
 

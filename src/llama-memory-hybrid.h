@@ -82,6 +82,7 @@ public:
 
     llama_kv_cache * get_mem_attn() const;
     llama_memory_recurrent * get_mem_recr() const;
+    bool commit_tree(const llama_tree_batch & tree, int accepted);
 
 private:
     const llama_hparams & hparams;

@@ -10131,6 +10131,7 @@ static void ggml_compute_forward_ssm_scan_f32(
     const ggml_tensor * src4 = dst->src[4]; // B  {d_state, n_group, n_seq_tokens, n_seqs}
     const ggml_tensor * src5 = dst->src[5]; // C  {d_state, n_group, n_seq_tokens, n_seqs}
     const ggml_tensor * src6 = dst->src[6]; // ids {n_seqs}
+    const int32_t * parents = dst->src[7] ? (const int32_t *) dst->src[7]->data : nullptr;
 
     const int ith = params->ith;
     const int nth = params->nth;
@@ -10172,6 +10173,10 @@ static void ggml_compute_forward_ssm_scan_f32(
               float * s  = (      float *) ((      char *) dst->data  + i3*(src0->nb[3]) + s_off); // {d_state, dim, nh, ns}
 
         for (int i2 = 0; i2 < nt; ++i2) {
+            if (parents && i2 > 0 && parents[i2] != i2 - 1) {
+                GGML_ASSERT(parents[i2] >= 0 && parents[i2] < i2);
+                s0 = (const float *) ((const char *) s + (nt - 1 - parents[i2])*ns*src0->nb[3]);
+            }
             const float * x  = (const float *) ((const char *) src1->data + i2*(src1->nb[2]) + i3*(src1->nb[3])); // {dim, nh, nt, ns}
             const float * dt = (const float *) ((const char *) src2->data + i2*(src2->nb[1]) + i3*(src2->nb[2])); // {nh, nt, ns}
             const float * A  = (const float *) ((const char *) src3->data); // {d_state, nh} or {1, nh}

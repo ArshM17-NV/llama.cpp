@@ -1103,6 +1103,15 @@ extern "C" {
                              enum llama_process_type   type,
                               struct llama_batch_ext * batch);
 
+    // Evaluate up to eight candidate nodes in one Nemotron-H hybrid decoder pass.
+    // Use one sequence, one output per token, and consecutive positions starting
+    // immediately after its committed prefix. parents[0] = -1 and parents[i] < i.
+    // Allocate at least n_nodes - 1 recurrent snapshots. On success call commit
+    // before the next decode; accepted_node=0 keeps only the root input.
+    LLAMA_API int32_t llama_decode_tree(struct llama_context * ctx,
+                                       const struct llama_batch_ext * batch, const int32_t * parents);
+    LLAMA_API int32_t llama_tree_commit(struct llama_context * ctx, int32_t accepted_node);
+
     // Set the number of threads used for decoding
     // n_threads is the number of threads used for generation (single token)
     // n_threads_batch is the number of threads used for prompt and batch processing (multiple tokens)
@@ -1177,6 +1186,11 @@ extern "C" {
     // If masked == true,  output the embeddings only for the tokens with batch.logits != 0
     // If masked == false, output the embeddings for all tokens in the batch regardless of batch.logits
     LLAMA_API void llama_set_embeddings_nextn(struct llama_context * ctx, bool value, bool masked);
+
+    // For a full, single-sequence LiLiCorr block without anchor features, return normalized draft
+    // states in nextn rows 1..K. Row 0 contains [top_k token IDs, top_k log probabilities] for each
+    // of the K draft positions. Disables vocabulary-logit readback on these blocks. Zero disables.
+    LLAMA_API bool llama_set_draft_shortlist(struct llama_context * ctx, int32_t top_k);
 
     // Select which appended NextN block the DECODER_MTP graph runs (offset past
     // the trunk: il = n_layer() + offset). Used by the speculative NextN driver to

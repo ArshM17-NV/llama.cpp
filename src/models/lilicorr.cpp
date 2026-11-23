@@ -79,6 +79,35 @@ void llama_model_dflash::load_tensors_lilicorr() {
     load_tensors_dflash2_conv();
 }
 
+static ggml_tensor * ranked_candidates(ggml_context * ctx, ggml_tensor * logits, int64_t top_k) {
+    const int64_t rows = logits->ne[1];
+    auto * ids = ggml_top_k(ctx, logits, top_k);
+    auto * values = ggml_reshape_3d(ctx, logits, 1, logits->ne[0], rows);
+    auto * selected = ggml_reshape_2d(ctx, ggml_get_rows(ctx, values, ids), top_k, rows);
+    auto * order = ggml_argsort(ctx, selected, GGML_SORT_ORDER_DESC);
+    return ggml_reshape_2d(ctx, ggml_get_rows(ctx, ggml_reshape_3d(ctx, ids, 1, top_k, rows), order), top_k, rows);
+}
+
+static ggml_tensor * treeflash_draft_rows(ggml_context * ctx, ggml_tensor * logits, ggml_tensor * hidden, int32_t k) {
+    const int64_t d = hidden->ne[1] - 1;
+    const int64_t width = hidden->ne[0];
+    const int64_t vocab = logits->ne[0];
+    logits = ggml_view_2d(ctx, logits, vocab, d, logits->nb[1], logits->nb[1]);
+    auto * ids = ranked_candidates(ctx, logits, k);
+    auto * selected = ggml_reshape_2d(ctx,
+            ggml_get_rows(ctx, ggml_reshape_3d(ctx, logits, 1, vocab, d), ids), k, d);
+    auto * max_id = ggml_view_2d(ctx, ids, 1, d, ids->nb[1], 0);
+    auto * probs = ggml_reshape_3d(ctx, ggml_soft_max(ctx, logits), 1, vocab, d);
+    auto * max_p = ggml_reshape_2d(ctx, ggml_get_rows(ctx, probs, max_id), 1, d);
+    auto * max_logit = ggml_view_2d(ctx, selected, 1, d, selected->nb[1], 0);
+    // log p(i) = logit(i) - max(logit) + log p(max). Works even when p(i) underflows.
+    auto * lp = ggml_add(ctx, ggml_sub(ctx, selected, max_logit), ggml_log(ctx, max_p));
+    auto * info = ggml_concat(ctx, ggml_cast(ctx, ids, GGML_TYPE_F32), lp, 0);
+    auto * anchor = ggml_pad(ctx, ggml_reshape_2d(ctx, info, 2*k*d, 1), width-2*k*d, 0, 0, 0);
+    auto * states = ggml_view_2d(ctx, hidden, width, d, hidden->nb[1], hidden->nb[1]);
+    return ggml_concat(ctx, anchor, states, 1);
+}
+
 static void build_lilicorr_scores(llm_graph_context & g, const llama_model & model,
         ggml_tensor * tok_embd, ggml_tensor * anchors) {
     ggml_context * ctx0 = g.ctx0;
@@ -104,14 +133,7 @@ static void build_lilicorr_scores(llm_graph_context & g, const llama_model & mod
     const int64_t factor_dim = model.lilicorr_out_head->ne[1];
     GGML_ASSERT(tokens_per_block == block_size);
 
-    ggml_tensor * candidates = ggml_top_k(ctx0, res->t_logits, top_k);
-    ggml_tensor * logits_rows = ggml_reshape_3d(ctx0, res->t_logits, 1, res->t_logits->ne[0], n_tokens);
-    ggml_tensor * candidate_logits = ggml_reshape_2d(ctx0,
-            ggml_get_rows(ctx0, logits_rows, candidates), top_k, n_tokens);
-    // Rank features and embeddings require candidates in descending logit order.
-    ggml_tensor * order = ggml_argsort(ctx0, candidate_logits, GGML_SORT_ORDER_DESC);
-    ggml_tensor * candidate_rows = ggml_reshape_3d(ctx0, candidates, 1, top_k, n_tokens);
-    candidates = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, candidate_rows, order), top_k, n_tokens);
+    ggml_tensor * candidates = ranked_candidates(ctx0, res->t_logits, top_k);
     ggml_tensor * prob_rows   = ggml_reshape_3d(ctx0, ggml_soft_max(ctx0, res->t_logits), 1, res->t_logits->ne[0], n_tokens);
     ggml_tensor * probs       = ggml_reshape_2d(ctx0,
             ggml_get_rows(ctx0, prob_rows, candidates), top_k, n_tokens);
@@ -276,5 +298,9 @@ llama_model_dflash::graph_lilicorr::graph_lilicorr(const llm_graph_params & para
 
     if (is_block) {
         build_lilicorr_scores(*this, model, get_tok_embd(*this, model), inp_anchor);
+    } else if (cparams.draft_shortlist && ubatch.n_seqs_unq == 1 && n_tokens == hparams.dflash_block_size) {
+        res->t_h_nextn = treeflash_draft_rows(ctx0, res->t_logits, cur, cparams.draft_shortlist);
+        ggml_build_forward_expand(gf, res->t_h_nextn);
+        res->t_logits = nullptr;
     }
 }

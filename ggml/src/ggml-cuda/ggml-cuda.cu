@@ -3100,6 +3100,7 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             ggml_cuda_op_ssm_conv(ctx, dst);
             break;
         case GGML_OP_SSM_SCAN:
+        case GGML_OP_SSM_SCAN_TREE:
             ggml_cuda_op_ssm_scan(ctx, dst);
             break;
         case GGML_OP_TOP_K:
@@ -3655,7 +3656,8 @@ static int ggml_cuda_try_ssm_scan_cache_fusion(
         const ggml_cgraph * cgraph, int node_idx, ggml_cuda_ssm_scan_fused_cache & fused_state_cpy) {
     const ggml_tensor * ssm = cgraph->nodes[node_idx];
     // the kernel skips the snapshot tail, so the scan output must not be a graph output
-    if (ssm->op != GGML_OP_SSM_SCAN || ssm->type != GGML_TYPE_F32 || (ssm->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+    if ((ssm->op != GGML_OP_SSM_SCAN && ssm->op != GGML_OP_SSM_SCAN_TREE) ||
+        ssm->type != GGML_TYPE_F32 || (ssm->flags & GGML_TENSOR_FLAG_OUTPUT)) {
         return 0;
     }
 
@@ -4521,7 +4523,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     // ssm_scan -> cpy: scatter recurrent-state snapshots into the cache
-    if (node->op == GGML_OP_SSM_SCAN) {
+    if (node->op == GGML_OP_SSM_SCAN || node->op == GGML_OP_SSM_SCAN_TREE) {
         ggml_cuda_ssm_scan_fused_cache fused_state_cpy;
         const int nodes_to_skip = ggml_cuda_try_ssm_scan_cache_fusion(cgraph, i, fused_state_cpy);
         if (nodes_to_skip > 0) {
@@ -6700,6 +6702,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16) &&
                    (op->src[1]->type == GGML_TYPE_F32 || op->src[1]->type == GGML_TYPE_F16) &&
                    (op->type         == GGML_TYPE_F32 || op->type         == GGML_TYPE_F16);
+        case GGML_OP_SSM_SCAN_TREE:
         case GGML_OP_SSM_SCAN: {
             const int32_t K = ggml_get_op_params_i32(op, 0);
 

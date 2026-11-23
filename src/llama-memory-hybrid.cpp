@@ -206,6 +206,22 @@ void llama_memory_hybrid::state_read(llama_io_read_i & io, llama_seq_id seq_id, 
     }
 }
 
+bool llama_memory_hybrid::commit_tree(const llama_tree_batch & tree, int accepted) {
+    const int tail = mem_recr->cells[tree.seq_id].tail;
+    if (tail < 0) {
+        return false;
+    }
+    auto & cell = mem_recr->cells[tail];
+    if (cell.pos != tree.root + tree.n_nodes - 1 || cell.seq_id.size() != 1 ||
+        !mem_attn->commit_tree(tree, accepted)) {
+        return false;
+    }
+    mem_recr->set_rs_idx(tree.seq_id, tree.n_nodes - 1 - accepted);
+    cell.pos = tree.root + tree.depth[accepted];
+    cell.rs_max = 0; // earlier snapshot planes may belong to siblings
+    return true;
+}
+
 llama_kv_cache * llama_memory_hybrid::get_mem_attn() const {
     return mem_attn.get();
 }

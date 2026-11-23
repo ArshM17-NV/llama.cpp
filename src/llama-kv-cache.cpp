@@ -434,6 +434,30 @@ void llama_kv_cache::clear(bool data) {
     }
 }
 
+bool llama_kv_cache::commit_tree(const llama_tree_batch & tree, int accepted) {
+    const uint32_t stream = seq_to_stream[tree.seq_id];
+    auto & cells = v_cells[stream];
+    const auto & positions = cells.seq_pos_get(tree.seq_id);
+    std::array<uint32_t, llama_tree_batch::max_nodes> indices;
+    auto it = positions.lower_bound({tree.root, 0});
+    for (int node = 0; node < tree.n_nodes; ++node, ++it) {
+        if (it == positions.end() || it->first != tree.root + node || cells.seq_count(it->second) != 1) {
+            return false;
+        }
+        indices[node] = it->second;
+    }
+    for (int node = 0; node < tree.n_nodes; ++node) {
+        const uint32_t cell = indices[node];
+        if ((tree.ancestors[accepted] & (1u << node)) == 0) {
+            cells.rm(cell);
+            v_heads[stream] = std::min(v_heads[stream], cell);
+        } else if (tree.depth[node] != node) {
+            cells.pos_relabel(cell, tree.root + tree.depth[node]);
+        }
+    }
+    return true;
+}
+
 bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
@@ -1825,6 +1849,13 @@ static void set_input_attn_mask_impl(const args_set_input_attn_mask & args, T * 
                 }
 
                 if (causal) {
+                    if (ubatch->tree && p0 >= ubatch->tree->root) {
+                        const int candidate = p0 - ubatch->tree->root;
+                        if (candidate >= ubatch->tree->n_nodes ||
+                            !(ubatch->tree->ancestors[iq] & (1u << candidate))) {
+                            goto skip;
+                        }
+                    }
                     // mask future tokens
                     if (p0 > p1) {
                         goto skip;

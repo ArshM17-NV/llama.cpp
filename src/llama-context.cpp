@@ -7,6 +7,7 @@
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-memory.h"
+#include "llama-memory-hybrid.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-moe-cache.h"
@@ -1408,6 +1409,20 @@ void llama_context::set_embeddings(bool value) {
     cparams.embeddings = value;
 }
 
+bool llama_context::set_draft_shortlist(int32_t top_k) {
+    const auto & hp = model.hparams;
+    if (top_k < 0 || (top_k > 0 && (llama_model_dflash_variant(&model) != LLAMA_DFLASH_VARIANT_LILICORR ||
+            !cparams.embeddings_nextn || hp.dflash_block_size < 2 || uint32_t(top_k) > model.vocab.n_tokens() ||
+            int64_t(top_k) * 2 * (hp.dflash_block_size - 1) > hp.n_embd || model.vocab.n_tokens() > (1u << 24)))) {
+        return false;
+    }
+    if (cparams.draft_shortlist != top_k) {
+        cparams.draft_shortlist = top_k;
+        sched_need_reserve = true;
+    }
+    return true;
+}
+
 void llama_context::set_embeddings_nextn(bool value, bool masked) {
     LLAMA_LOG_DEBUG("%s: value = %d, masked = %d\n", __func__, value, masked);
 
@@ -2135,7 +2150,62 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
     return false; // all sequences use backend sampling
 }
 
-int llama_context::decode(const llama_batch_ext & batch_inp) {
+int llama_context::decode_tree(const llama_batch_ext & batch, const int32_t * parents) {
+    const size_t n = batch.tokens.size();
+    if (!parents || n == 0 || n > llama_tree_batch::max_nodes || n > cparams.n_ubatch ||
+        n - 1 > cparams.n_rs_seq || parents[0] != -1 || !cparams.causal_attn ||
+        (model.arch != LLM_ARCH_NEMOTRON_H && model.arch != LLM_ARCH_NEMOTRON_H_MOE) ||
+        cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT || !dynamic_cast<llama_memory_hybrid *>(memory.get())) {
+        return -1;
+    }
+    const auto & first = batch.tokens.front();
+    if (first.seq_ids.size() != 1) {
+        return -1;
+    }
+    auto tree = std::make_shared<llama_tree_batch>();
+    tree->n_nodes = (int) n;
+    tree->seq_id = *first.seq_ids.begin();
+    tree->root = first.pos[0];
+    if (tree->seq_id < 0 || (uint32_t) tree->seq_id >= cparams.n_seq_max || tree->root < 0 ||
+        tree->root > INT32_MAX - (int) n || tree->root != memory->seq_pos_max(tree->seq_id) + 1) {
+        return -1;
+    }
+    for (int i = 0; i < tree->n_nodes; ++i) {
+        const auto & token = batch.tokens[i];
+        const int p = parents[i];
+        if (!token.output || token.id == LLAMA_TOKEN_NULL || token.has_embd ||
+            token.seq_ids != first.seq_ids || token.pos[0] != tree->root + i ||
+            (i > 0 && (p < 0 || p >= i))) {
+            return -1;
+        }
+        tree->parent[i] = p;
+        tree->depth[i] = i == 0 ? 0 : tree->depth[p] + 1;
+        tree->ancestors[i] = (i == 0 ? 0u : tree->ancestors[p]) | (1u << i);
+    }
+    const int ret = decode(batch, tree);
+    if (ret == 0) {
+        pending_tree = tree;
+    }
+    return ret;
+}
+
+int llama_context::commit_tree(int accepted) {
+    if (!pending_tree || accepted < 0 || accepted >= pending_tree->n_nodes) {
+        return -1;
+    }
+    auto * hybrid = static_cast<llama_memory_hybrid *>(memory.get());
+    if (!hybrid->commit_tree(*pending_tree, accepted)) {
+        return -1;
+    }
+    pending_tree.reset();
+    return 0;
+}
+
+int llama_context::decode(const llama_batch_ext & batch_inp, const std::shared_ptr<const llama_tree_batch> & tree) {
+    if (pending_tree) {
+        LLAMA_LOG_ERROR("%s: commit the previous tree before decoding again\n", __func__);
+        return -1;
+    }
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
         return encode(batch_inp);
@@ -2342,7 +2412,11 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     }
 
     do {
-        const auto & ubatch = mctx->get_ubatch();
+        auto ubatch = mctx->get_ubatch();
+        if (tree && tree->depth[tree->n_nodes - 1] != tree->n_nodes - 1) {
+            GGML_ASSERT(ubatch.n_tokens == (uint32_t) tree->n_nodes && ubatch.n_seqs == 1);
+            ubatch.tree = tree;
+        }
 
         // count the outputs in this ubatch
         {
@@ -4700,6 +4774,10 @@ void llama_set_embeddings_nextn(llama_context * ctx, bool value, bool masked) {
     ctx->set_embeddings_nextn(value, masked);
 }
 
+bool llama_set_draft_shortlist(llama_context * ctx, int32_t top_k) {
+    return ctx->set_draft_shortlist(top_k);
+}
+
 bool llama_set_embeddings_nextn_dev(llama_context * ctx, bool value) {
     return ctx->set_embeddings_nextn_dev(value);
 }
@@ -5051,6 +5129,14 @@ int llama_context::decode(const llama_batch & batch_inp) {
 }
 
 ///
+
+int32_t llama_decode_tree(llama_context * ctx, const llama_batch_ext * batch, const int32_t * parents) {
+    return ctx && batch ? ctx->decode_tree(*batch, parents) : -1;
+}
+
+int32_t llama_tree_commit(llama_context * ctx, int32_t accepted_node) {
+    return ctx ? ctx->commit_tree(accepted_node) : -1;
+}
 
 int32_t llama_encode(
         llama_context * ctx,

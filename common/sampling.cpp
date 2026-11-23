@@ -695,6 +695,46 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     return id;
 }
 
+bool common_sampler_can_hedge_tree(const common_sampler * smpl) {
+    const int n = llama_sampler_chain_n(smpl->chain);
+    return smpl->params.temp == 1.0f && n > 0 &&
+            std::string(llama_sampler_name(llama_sampler_chain_get(smpl->chain, n - 1))) == "dist";
+}
+
+static uint64_t tree_mix64(uint64_t x) {
+    x += UINT64_C(0x9e3779b97f4a7c15);
+    x = (x ^ (x >> 30)) * UINT64_C(0xbf58476d1ce4e5b9);
+    x = (x ^ (x >> 27)) * UINT64_C(0x94d049bb133111eb);
+    return x ^ (x >> 31);
+}
+
+float common_tree_gumbel(uint32_t seed, llama_pos position, llama_token token) {
+    const uint64_t counter = (uint64_t(uint32_t(position)) << 32) | uint32_t(token);
+    const uint64_t bits = tree_mix64(counter ^ tree_mix64(seed));
+    const double u = (double(bits >> 12) + 0.5) / 4503599627370496.0;
+    return static_cast<float>(-std::log(-std::log(u)));
+}
+
+llama_token common_sampler_sample_tree(common_sampler * smpl, llama_context * ctx, int row, llama_pos position) {
+    if (!common_sampler_can_hedge_tree(smpl)) {
+        return common_sampler_sample(smpl, ctx, row);
+    }
+    // Apply the normal filters, including grammar, before drawing from the full target distribution.
+    common_sampler_sample(smpl, ctx, row, true);
+    auto & candidates = smpl->cur_p;
+    const uint32_t seed = common_sampler_get_seed(smpl);
+    double best = -std::numeric_limits<double>::infinity();
+    for (size_t i = 0; i < candidates.size; ++i) {
+        const auto & c = candidates.data[i];
+        const double score = std::log(double(c.p)) + common_tree_gumbel(seed, position, c.id);
+        if (score > best) {
+            best = score;
+            candidates.selected = static_cast<int64_t>(i);
+        }
+    }
+    return candidates.data[candidates.selected].id;
+}
+
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, bool grammar_first) {
     GGML_ASSERT(idxs.size() == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
 

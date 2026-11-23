@@ -13,6 +13,18 @@
 #include <unordered_map>
 #include <unordered_set>
 
+// Physical cache positions in a tree batch are root + node index. Model
+// positions and attention visibility follow the parent links instead.
+struct llama_tree_batch {
+    static constexpr int max_nodes = 8;
+    int n_nodes = 0;
+    llama_seq_id seq_id;
+    llama_pos root;
+    std::array<int32_t, max_nodes> parent;
+    std::array<int32_t, max_nodes> depth;
+    std::array<unsigned, max_nodes> ancestors;
+};
+
 // keep this struct lightweight
 struct llama_ubatch {
     bool equal_seqs() const {
@@ -85,6 +97,7 @@ struct llama_ubatch {
 
     // the llama_ubatch pointers above point to this data if set. otherwise - point to external non-owning data
     std::shared_ptr<data_t> data;
+    std::shared_ptr<const llama_tree_batch> tree = nullptr;
 };
 
 // crash if a mixed ubatch reaches code that expects only tokens or only embd

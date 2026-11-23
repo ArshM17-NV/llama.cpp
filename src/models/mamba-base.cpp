@@ -204,7 +204,26 @@ ggml_tensor * llm_build_mamba_base::build_mamba2_layer(llm_graph_input_rs * inp,
         // => {d_conv - 1 + n_seq_tokens, d_inner + 2*n_group*d_state, n_seqs}
         ggml_tensor * conv_x = ggml_concat(ctx0, conv, ggml_transpose(ctx0, xBC), 0);
 
-        build_conv_state_store(inp, conv_states_all, conv_x, d_conv - 1, 0);
+        if (ubatch.tree) {
+            // Turn each root-to-node convolution window into a one-token
+            // sequence. The convolution weights and arithmetic remain shared.
+            auto * history = ggml_cont(ctx0, ggml_transpose(ctx0, conv_x));
+            auto * windows = ggml_get_rows(ctx0, history, inp->tree_conv_rows);
+            const int64_t channels = conv_x->ne[1];
+            windows = ggml_reshape_3d(ctx0, windows, channels, d_conv, n_seq_tokens);
+            conv_x = ggml_cont(ctx0, ggml_permute(ctx0, windows, 1, 0, 2, 3));
+
+            // Cache each window's newest d_conv-1 inputs in the same reverse
+            // node order as the SSM snapshots. One graph store for all nodes.
+            auto * last = ggml_view_3d(ctx0, conv_x, d_conv - 1, channels, n_seq_tokens,
+                    conv_x->nb[1], conv_x->nb[2], conv_x->nb[0]);
+            auto * rows = ggml_reshape_2d(ctx0, ggml_cont(ctx0, last), (d_conv - 1)*channels, n_seq_tokens);
+            auto * slots = ggml_view_2d(ctx0, conv_states_all, rows->ne[0], n_seq_tokens,
+                    mem_size*conv_states_all->nb[1], kv_head*conv_states_all->nb[1]);
+            ggml_build_forward_expand(gf, ggml_set_rows(ctx0, slots, rows, inp->tree_snapshot_rows));
+        } else {
+            build_conv_state_store(inp, conv_states_all, conv_x, d_conv - 1, 0);
+        }
 
         // 1D convolution
         // The equivalent is to make a self-overlapping view of conv_x
@@ -216,6 +235,9 @@ ggml_tensor * llm_build_mamba_base::build_mamba2_layer(llm_graph_input_rs * inp,
         // and then you're left with the resulting x tensor.
         // For simultaneous sequences, all sequences need to have the same length.
         xBC = ggml_ssm_conv(ctx0, conv_x, model.layers[il].ssm_conv1d);
+        if (ubatch.tree) {
+            xBC = ggml_reshape_3d(ctx0, xBC, xBC->ne[0], n_seq_tokens, n_seqs);
+        }
 
         // bias
         xBC = ggml_add(ctx0, xBC, model.layers[il].ssm_conv1d_b);
@@ -247,6 +269,9 @@ ggml_tensor * llm_build_mamba_base::build_mamba2_layer(llm_graph_input_rs * inp,
             // TODO: use semistructured matrices to implement state-space duality
             // => {d_inner, n_seq_tokens, n_seqs} and {d_state, d_inner, n_seqs}
             // K > 1 asks the backend to return rollback snapshots in addition to the final state.
+            if (ubatch.tree) {
+                return ggml_ssm_scan_tree(ctx, ssm, x, dt, A, B, C, ids, inp->tree_parents);
+            }
             return ggml_ssm_scan(ctx, ssm, x, dt, A, B, C, ids, K);
         };
 

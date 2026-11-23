@@ -271,6 +271,16 @@ void llm_graph_input_pos::set_input(const llama_ubatch * ubatch) {
     if (ubatch->pos && pos) {
         const int64_t n_tokens = ubatch->n_tokens;
 
+        if (ubatch->tree) {
+            GGML_ASSERT(n_pos_per_embd == 1);
+            std::array<llama_pos, llama_tree_batch::max_nodes> logical;
+            for (int i = 0; i < ubatch->tree->n_nodes; ++i) {
+                logical[i] = ubatch->tree->root + ubatch->tree->depth[i];
+            }
+            ggml_backend_tensor_set(pos, logical.data(), 0, n_tokens*sizeof(llama_pos));
+            return;
+        }
+
         const bool has_embd = ubatch->is_mixed() || ubatch->token == nullptr;
         if (rope_section_order == LLAMA_ROPE_SECTION_ORDER_TYXZ || !has_embd) {
             ggml_backend_tensor_set(pos, ubatch->pos, 0, n_tokens*n_pos_per_embd*ggml_element_size(pos));
@@ -527,7 +537,24 @@ void llm_graph_input_cls::set_input(const llama_ubatch * ubatch) {
 }
 
 void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
-    GGML_UNUSED(ubatch);
+    if (tree_parents) {
+        const auto & tree = *ubatch->tree;
+        ggml_backend_tensor_set(tree_parents, tree.parent.data(), 0, tree.n_nodes*sizeof(int32_t));
+        const int width = tree_conv_rows->ne[0] / tree.n_nodes;
+        std::vector<int32_t> rows(tree_conv_rows->ne[0]);
+        std::array<int32_t, llama_tree_batch::max_nodes> slots;
+        for (int node = 0; node < tree.n_nodes; ++node) {
+            slots[node] = tree.n_nodes - 1 - node;
+            int ancestor = node;
+            for (int k = width - 1; k >= 0; --k) {
+                // Negative indices select the committed convolution history.
+                rows[node*width + k] = width - 1 + ancestor;
+                ancestor = ancestor >= 0 ? tree.parent[ancestor] : ancestor - 1;
+            }
+        }
+        ggml_backend_tensor_set(tree_conv_rows, rows.data(), 0, rows.size()*sizeof(int32_t));
+        ggml_backend_tensor_set(tree_snapshot_rows, slots.data(), 0, tree.n_nodes*sizeof(int32_t));
+    }
 
     const int64_t n_rs = mctx->get_n_rs();
 
@@ -1250,17 +1277,8 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
     // kv_rows and the mask stay unallocated if all attention layers have their own (e.g. qwen4exp QSA)
     mctx->get_attn()->set_input_attn_mask(inp_attn->self_attn_mask, ubatch, cparams.causal_attn);
 
-    const int64_t n_rs = mctx->get_recr()->get_n_rs();
-
-    if (inp_rs->s_copy) {
-        GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
-        int32_t * data = (int32_t *) inp_rs->s_copy->data;
-
-        // assuming copy destinations ALWAYS happen ONLY on the cells between head and head+n
-        for (uint32_t i = 0; i < n_rs; ++i) {
-            data[i] = mctx->get_recr()->s_copy(i);
-        }
-    }
+    inp_rs->mctx = mctx->get_recr();
+    inp_rs->set_input(ubatch);
 }
 
 bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
@@ -4287,6 +4305,14 @@ llm_graph_input_mem_hybrid * llm_graph_context::build_inp_mem_hybrid() const {
     const auto * mctx_cur = static_cast<const llama_memory_hybrid_context *>(mctx);
 
     auto inp_rs   = build_rs_inp_impl     (ctx0, ubatch, mctx_cur->get_recr());
+    if (ubatch.tree) {
+        inp_rs->tree_parents = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ubatch.n_tokens);
+        inp_rs->tree_conv_rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ubatch.n_tokens*hparams.ssm_d_conv);
+        inp_rs->tree_snapshot_rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ubatch.n_tokens);
+        ggml_set_input(inp_rs->tree_parents);
+        ggml_set_input(inp_rs->tree_conv_rows);
+        ggml_set_input(inp_rs->tree_snapshot_rows);
+    }
     auto inp_attn = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur->get_attn());
 
     auto inp = std::make_unique<llm_graph_input_mem_hybrid>(cparams, std::move(inp_attn), std::move(inp_rs), mctx_cur);

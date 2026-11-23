@@ -9,6 +9,7 @@
 #include "ngram-map.h"
 #include "ngram-mod.h"
 #include "sampling.h"
+#include "treeflash-head.h"
 
 #include <algorithm>
 #include <cassert>
@@ -17,6 +18,7 @@
 #include <fstream>
 #include <iomanip>
 #include <map>
+#include <numeric>
 #include <random>
 #include <cinttypes>
 
@@ -207,6 +209,8 @@ struct common_speculative_impl {
     virtual void begin(llama_seq_id seq_id, const llama_tokens & prompt) = 0;
 
     virtual bool process(const common_batch & batch) = 0;
+
+    virtual bool commit_tree(llama_seq_id, const std::vector<int32_t> &, llama_token, float) { return false; }
 
     virtual void draft(common_speculative_draft_params_vec & dparams) = 0;
 
@@ -1178,6 +1182,10 @@ public:
     }
 
     bool process(const common_batch & batch_in) override {
+        return inject_features(batch_in, nullptr);
+    }
+
+    bool inject_features(const common_batch & batch_in, const std::vector<int32_t> * selected_rows) {
         if (batch_in.size() <= 0) {
             return true;
         }
@@ -1236,7 +1244,7 @@ public:
                         const int32_t   row        = i_batch_beg[seq_id] + offset + i;
                         const llama_pos p          = batch_in.tokens[row].pos[0];
                         const llama_pos pos_arr[4] = { p, p, p, 0 };
-                        batch_inject.add_embd_row(row, pos_arr, seq_id, false);
+                        batch_inject.add_embd_row(selected_rows ? selected_rows->at(row) : row, pos_arr, seq_id, false);
                     }
 
                     const int32_t rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch_inject.get());
@@ -1258,7 +1266,8 @@ public:
                     }
                     for (int32_t i = 0; i < n_chunk; ++i) {
                         float       * dst = features_buf.data() + (size_t) i * n_embd_enc + k * (size_t) n_embd_tgt;
-                        const float * src = layer + (size_t) (i_batch_beg[seq_id] + offset + i) * n_embd_tgt;
+                        const int32_t row = i_batch_beg[seq_id] + offset + i;
+                        const float * src = layer + (size_t) (selected_rows ? selected_rows->at(row) : row) * n_embd_tgt;
                         std::memcpy(dst, src, (size_t) n_embd_tgt * sizeof(float));
                     }
                 }
@@ -1787,6 +1796,116 @@ public:
                 result.clear();
             }
         }
+    }
+};
+
+struct common_speculative_impl_treeflash final : common_speculative_impl_draft_dflash {
+    using head_t = common_treeflash_head;
+    head_t head;
+    common_treeflash_history history;
+    std::vector<common_treeflash_node> tree;
+    llama_pos root_pos = 0;
+    bool new_request = true;
+
+    common_speculative_impl_treeflash(const common_params_speculative & config, uint32_t n_seq)
+            : common_speculative_impl_draft_dflash(config, n_seq, COMMON_SPECULATIVE_TYPE_DRAFT_LILICORR),
+              head(config.draft.tree_head, config.draft.devices.empty()
+                      ? ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU) : config.draft.devices.front()) {
+        const auto * vocab = llama_model_get_vocab(llama_get_model(params.ctx_tgt));
+        if (n_seq != 1 || block_size != head_t::nodes || head.hidden_size() != n_embd_dec ||
+                head.vocab_size() != llama_vocab_n_tokens(vocab) || llama_n_rs_seq(params.ctx_tgt) < head_t::depth ||
+                llama_n_ubatch(params.ctx_tgt) < head_t::nodes || llama_n_ubatch(params.ctx_dft) < head_t::nodes) {
+            throw std::runtime_error("TreeFlash requires one slot, a matching eight-row drafter and head, and eight-row microbatches");
+        }
+        params.n_max = head_t::depth;
+        init({head_t::depth, false, true, false});
+        if (!llama_set_draft_shortlist(params.ctx_dft, head_t::top_k)) {
+            throw std::runtime_error("TreeFlash requires a LiLiCorr draft context that can return its candidate shortlist");
+        }
+        LOG_INF("%s: TreeFlash enabled (depth %d, %d candidates, %d verifier rows)\n",
+                __func__, head_t::depth, head_t::top_k, head_t::nodes);
+    }
+
+    ~common_speculative_impl_treeflash() override {
+        llama_set_draft_shortlist(params.ctx_dft, 0);
+    }
+
+    void begin(llama_seq_id seq, const llama_tokens & prompt) override {
+        common_speculative_impl_draft_dflash::begin(seq, prompt);
+        new_request = true;
+        tree.clear();
+    }
+
+    void draft(common_speculative_draft_params_vec & requests) override {
+        auto & req = requests.at(0);
+        if (!req.drafting) {
+            return;
+        }
+        if (!req.tree_parents) {
+            throw std::runtime_error("TreeFlash requires tree-aware verification");
+        }
+        req.tree_parents->clear();
+        tree.clear();
+        if (req.n_max < head_t::depth) {
+            return; // finish short tails using ordinary target decoding
+        }
+        if (new_request) {
+            auto prompt = *req.prompt;
+            prompt.push_back(req.id_last);
+            history.reset(prompt);
+            new_request = false;
+        }
+        root_pos = req.pos0;
+        batch.clear();
+        for (int i = 0; i < head_t::nodes; ++i) {
+            batch.add(i == 0 ? req.id_last : mask_token_id, root_pos + i, 0, true);
+        }
+        if (llama_process(params.ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get()) != 0) {
+            throw std::runtime_error("TreeFlash draft forward failed");
+        }
+        std::array<llama_token, head_t::depth * head_t::top_k> ids;
+        std::array<float, head_t::depth * head_t::top_k> logp;
+        const float * hidden = llama_get_embeddings_nextn(params.ctx_dft);
+        if (!hidden) {
+            throw std::runtime_error("TreeFlash draft shortlist and hidden states unavailable");
+        }
+        for (int d = 0; d < head_t::depth; ++d) {
+            const float * row = hidden + 2*d*head_t::top_k;
+            for (int k = 0; k < head_t::top_k; ++k) {
+                ids[d*head_t::top_k+k] = llama_token(row[k]);
+                logp[d*head_t::top_k+k] = row[head_t::top_k+k];
+            }
+        }
+        std::array<float, head_t::depth * head_t::top_k> noise;
+        if (req.tree_hedge) {
+            for (size_t i = 0; i < ids.size(); ++i) {
+                noise[i] = common_tree_gumbel(req.seed, root_pos + int32_t(i / head_t::top_k), ids[i]);
+            }
+        }
+        tree = head.propose(req.id_last, ids.data(), logp.data(), hidden + n_embd_dec, history,
+                req.tree_hedge ? noise.data() : nullptr);
+        for (const auto & node : tree) {
+            req.tree_parents->push_back(node.parent);
+            if (node.parent >= 0) {
+                req.result->push_back(node.token);
+            }
+        }
+    }
+
+    bool commit_tree(llama_seq_id seq, const std::vector<int32_t> & path, llama_token bonus, float top_p) override {
+        common_batch accepted(params.ctx_dft);
+        llama_tokens words;
+        for (const int32_t row : path) {
+            const auto & node = tree.at(row);
+            accepted.add(node.token, root_pos + node.depth, seq, false);
+            words.push_back(node.token);
+        }
+        for (size_t i = 0; i < tree.size(); ++i) {
+            history.observe_logits(tree[i].token, llama_get_logits_ith(params.ctx_tgt, int32_t(i)), head.vocab_size(), top_p);
+        }
+        words.push_back(bonus);
+        history.commit(words);
+        return inject_features(accepted, &path);
     }
 };
 
@@ -2890,6 +3009,9 @@ static uint32_t common_get_enabled_speculative_configs(const std::vector<common_
 }
 
 int32_t common_speculative_n_max(const common_params_speculative * spec) {
+    if (!spec->draft.tree_head.empty()) {
+        return common_treeflash_head::depth;
+    }
     int32_t n_max = 0;
 
     for (const auto type : spec->types) {
@@ -3079,7 +3201,7 @@ common_params common_base_params_to_speculative(const common_params & params) {
         });
     if (has_block_draft) {
         // per-seq output positions: DFlash decodes anchor + n_max masks (n_max + 1); DSpark n_max -> +1 covers both
-        const int32_t per_seq = std::max(1, params_spec.n_max + 1);
+        const int32_t per_seq = params_spec.tree_head.empty() ? std::max(1, params_spec.n_max + 1) : common_treeflash_head::nodes;
         result.n_outputs_max = params.n_parallel * per_seq;
         if (params_spec.backend_sampling) {
             result.n_outputs_max_per_seq = per_seq;
@@ -3186,6 +3308,14 @@ common_speculative_output_limits common_speculative_get_output_limits(
 // initialization of the speculative decoding system
 //
 common_speculative * common_speculative_init(common_params_speculative & params, uint32_t n_seq) {
+    if (!params.draft.tree_head.empty()) {
+        if (!params.draft.ctx_dft || llama_model_dflash_variant(llama_get_model(params.draft.ctx_dft)) != LLAMA_DFLASH_VARIANT_LILICORR ||
+                params.has_synth() || std::any_of(params.types.begin(), params.types.end(), [](common_speculative_type t) {
+                    return t != COMMON_SPECULATIVE_TYPE_NONE && t != COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH && t != COMMON_SPECULATIVE_TYPE_DRAFT_LILICORR;
+                })) {
+            throw std::runtime_error("--spec-tree-head requires the LiLiCorr draft model and real tree verification");
+        }
+    }
     // Compute the implementations to use based on the config and their order of preference
     std::vector<common_speculative_config> configs = {}; // list of speculative configs to try
     {
@@ -3274,7 +3404,11 @@ common_speculative * common_speculative_init(common_params_speculative & params,
                         impls.push_back(std::make_unique<common_speculative_impl_draft_dflash2>(config.params, n_seq));
                         break;
                     case COMMON_SPECULATIVE_TYPE_DRAFT_LILICORR:
-                        impls.push_back(std::make_unique<common_speculative_impl_draft_lilicorr>(config.params, n_seq));
+                        if (config.params.draft.tree_head.empty()) {
+                            impls.push_back(std::make_unique<common_speculative_impl_draft_lilicorr>(config.params, n_seq));
+                        } else {
+                            impls.push_back(std::make_unique<common_speculative_impl_treeflash>(config.params, n_seq));
+                        }
                         break;
                     default:
                         impls.push_back(std::make_unique<common_speculative_impl_draft_dflash>(config.params, n_seq));
@@ -3517,6 +3651,11 @@ void common_speculative_draft(common_speculative * spec) {
             dp.drafting = false;
         }
     }
+}
+
+bool common_speculative_commit_tree(common_speculative * spec, llama_seq_id seq,
+        const std::vector<int32_t> & path, llama_token bonus, float top_p) {
+    return spec->impl_last.at(seq)->commit_tree(seq, path, bonus, top_p);
 }
 
 void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, uint16_t n_accepted) {

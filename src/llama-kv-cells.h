@@ -565,6 +565,15 @@ public:
         ext[i] = p;
     }
 
+    // Move the logical position after tree verification. The cached key was
+    // evaluated on this path and needs no RoPE rotation.
+    void pos_relabel(uint32_t i, llama_pos p) {
+        assert(!is_empty(i) && p >= 0);
+        seq_pos_rm(i);
+        pos[i] = p;
+        seq_pos_add(i);
+    }
+
     // pos[i] = pos[i] + d
     // sets "has_shift" to true
     // note: call only if the cell is not empty

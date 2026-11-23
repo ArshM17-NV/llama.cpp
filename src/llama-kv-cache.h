@@ -160,6 +160,7 @@ public:
     uint32_t get_size()     const;
     uint32_t get_n_seq_max() const;
     uint32_t get_n_stream() const;
+    bool commit_tree(const llama_tree_batch & tree, int accepted);
 
     bool get_has_shift() const;
 

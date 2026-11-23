@@ -79,7 +79,13 @@ struct common_speculative_draft_params {
     // the target's temp and seed, read only when the drafter samples probabilistically
     float    temp = 1.0f;
     uint32_t seed = LLAMA_DEFAULT_SEED;
+    std::vector<int32_t> * tree_parents = nullptr; // includes the pending root
+    bool tree_hedge = false;
 };
+
+// Save the selected verifier rows in the drafter's context, and update its request-local proposal history.
+bool common_speculative_commit_tree(common_speculative * spec, llama_seq_id seq,
+        const std::vector<int32_t> & path, llama_token bonus, float top_p);
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);
 

@@ -1118,9 +1118,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "SLEEP",
 
     "SIGMOID_BACK",
+    "SSM_SCAN_TREE",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1235,9 +1236,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sleep(x)",
 
     "sigmoid_back(x)",
+    "ssm_scan_tree(x)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5712,6 +5714,19 @@ struct ggml_tensor * ggml_ssm_scan(
 
     ggml_set_op_params_i32(result, 0, (int32_t) K);
 
+    return result;
+}
+
+struct ggml_tensor * ggml_ssm_scan_tree(
+        struct ggml_context * ctx, struct ggml_tensor * s, struct ggml_tensor * x,
+        struct ggml_tensor * dt, struct ggml_tensor * A, struct ggml_tensor * B,
+        struct ggml_tensor * C, struct ggml_tensor * ids, struct ggml_tensor * parents) {
+    GGML_ASSERT(A->ne[0] == 1 && x->ne[3] == 1);
+    GGML_ASSERT(ggml_is_vector(parents) && ggml_is_contiguous(parents));
+    GGML_ASSERT(parents->type == GGML_TYPE_I32 && parents->ne[0] == x->ne[2]);
+    struct ggml_tensor * result = ggml_ssm_scan(ctx, s, x, dt, A, B, C, ids, x->ne[2]);
+    result->op = GGML_OP_SSM_SCAN_TREE;
+    result->src[7] = parents;
     return result;
 }
 

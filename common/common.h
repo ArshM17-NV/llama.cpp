@@ -353,6 +353,7 @@ struct common_params_speculative_draft {
     bool probabilistic = false; // sample the draft and verify by rejection, instead of argmax and match
 
     common_params_model mparams;
+    std::string tree_head; // optional TreeFlash head for the LiLiCorr draft backbone
 
     llama_context * ctx_tgt = nullptr;
     llama_context * ctx_dft = nullptr;
@@ -415,6 +416,9 @@ struct common_params_speculative {
     }
 
     uint32_t need_n_rs_seq() const {
+        if (!draft.tree_head.empty()) {
+            return 7;
+        }
         bool needs_rs_seq = std::any_of(types.begin(), types.end(), [&](auto t) {
             return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP     ||
                    t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3  ||

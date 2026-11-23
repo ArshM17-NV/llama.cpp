@@ -2084,6 +2084,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_ssm_conv(params, tensor);
             } break;
         case GGML_OP_SSM_SCAN:
+        case GGML_OP_SSM_SCAN_TREE:
             {
                 ggml_compute_forward_ssm_scan(params, tensor);
             } break;
@@ -2473,6 +2474,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_FLASH_ATTN_BACK:
         case GGML_OP_SSM_CONV:
         case GGML_OP_SSM_SCAN:
+        case GGML_OP_SSM_SCAN_TREE:
         case GGML_OP_LIGHTNING_INDEXER:
             {
                 n_tasks = n_threads;

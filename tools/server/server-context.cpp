@@ -301,6 +301,7 @@ struct server_slot {
     common_speculative * spec;
 
     llama_tokens spec_draft;
+    std::vector<int32_t> tree_parents;
 
     // draft candidates per token in spec_draft; only draft-simple and draft-mtp fill it
     std::vector<std::vector<llama_token_data>> spec_draft_q;
@@ -449,6 +450,7 @@ struct server_slot {
 
         if (can_speculate()) {
             spec_draft.clear();
+            tree_parents.clear();
             spec_i_batch.clear();
             spec_ckpt.clear();
         }
@@ -1519,7 +1521,7 @@ private:
                 spec.reset(common_speculative_init(params_base.speculative, params_base.n_parallel));
             } catch (const std::exception & e) {
                 SRV_ERR("failed to initialize speculative decoding context: %s\n", e.what());
-                if (params_base.speculative.has_synth()) {
+                if (params_base.speculative.has_synth() || !params_base.speculative.draft.tree_head.empty()) {
                     return false;
                 }
             }
@@ -1532,6 +1534,10 @@ private:
         if (spec) {
             SRV_TRC("%s", "speculative decoding context initialized\n");
         } else {
+            if (!params_base.speculative.draft.tree_head.empty()) {
+                SRV_ERR("%s", "could not initialize TreeFlash\n");
+                return false;
+            }
             spec_init.reset();
             ctx_dft   = nullptr;
             model_dft = nullptr;
@@ -2012,6 +2018,7 @@ private:
             const bool need_pre_sample_logits = task.params.sampling.n_probs > 0 && !task.params.post_sampling_probs;
 
             bool use_backend_sampling = task.params.sampling.backend_sampling;
+            use_backend_sampling &= params_base.speculative.draft.tree_head.empty();
 
             // TODO: getting pre sampling logits is not yet supported with backend sampling
             use_backend_sampling &= !need_pre_sample_logits;
@@ -3859,7 +3866,10 @@ private:
                             /* .result   = */ &slot.spec_draft,
                             /* .result_q = */ spec_reject ? &slot.spec_draft_q : nullptr,
                             /* .temp     = */ slot.task->params.sampling.temp,
-                            /* .seed     = */ slot.task->params.sampling.seed,
+                            /* .seed     = */ params_base.speculative.draft.tree_head.empty()
+                                    ? slot.task->params.sampling.seed : common_sampler_get_seed(slot.smpl.get()),
+                            /* .tree_parents = */ &slot.tree_parents,
+                            /* .tree_hedge   = */ !params_base.speculative.draft.tree_head.empty() && common_sampler_can_hedge_tree(slot.smpl.get()),
                         };
 
                         drafting.push_back(&slot);
@@ -4638,8 +4648,17 @@ private:
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
+        server_slot * tree_slot = batch.slot_batched && !batch.slot_batched->tree_parents.empty()
+                ? batch.slot_batched : nullptr;
         queue_tasks.yield_to_queue([&]() {
-            ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
+            if (tree_slot) {
+                if (off != 0 || batch.view.size() != (int32_t) tree_slot->tree_parents.size()) {
+                    throw std::runtime_error("TreeFlash requires an entire tree in a single batch");
+                }
+                ret = llama_decode_tree(ctx_tgt, batch.view.get(), tree_slot->tree_parents.data());
+            } else {
+                ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
+            }
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
             }
@@ -4649,7 +4668,7 @@ private:
             {
                 std::string err;
 
-                if (n_batch == 1 && ret == 1) {
+                if (ret == 1 && (tree_slot ? !try_clear_idle_slots() : n_batch == 1)) {
                     // TODO: try to terminate only the largest active slot/sequence and continue with the rest
                     //       need to remove the tokens from the current batch too
                     err = "Context size has been exceeded.";
@@ -4686,11 +4705,11 @@ private:
             }
 
             // retry with half the batch size to try to find a free slot in the KV cache
-            if (!try_clear_idle_slots()) {
+            if (!tree_slot && !try_clear_idle_slots()) {
                 n_batch /= 2;
             }
 
-            SRV_WRN("failed to find free space in the KV cache, retrying with smaller batch size, off = %d, n_batch = %d, ret = %d\n", off, n_batch, ret);
+            SRV_WRN("failed to find free space in the KV cache, retrying, off = %d, n_batch = %d, ret = %d\n", off, n_batch, ret);
 
             return false; // retry with the updated n_batch
         } else {
@@ -4701,7 +4720,7 @@ private:
         // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
         //       for now, always re-evaluate for simplicity
         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
-        if (spec) {
+        if (spec && !tree_slot) {
             bool ok = true;
             queue_tasks.yield_to_queue([&]() {
                 ok = common_speculative_process(spec.get(), batch.view);
@@ -4880,7 +4899,8 @@ private:
 
             // verify and try to accept the draft
             {
-                common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
+                const bool verifying_tree = !slot.tree_parents.empty();
+                common_sampler_ptr smpl_save(verifying_tree ? nullptr : common_sampler_clone(slot.smpl.get()));
 
                 GGML_ASSERT(spec_i_batch.size() == n_draft + 1);
                 GGML_ASSERT(slot.spec_draft_q.empty() || (slot.spec_draft_q.size() == slot.spec_draft.size()));
@@ -4890,7 +4910,35 @@ private:
                 const bool use_rejection = slot.use_spec_rejection() && !slot.spec_draft_q.empty();
 
                 std::vector<llama_token> accepted;
-                if (!synth_probs.empty()) {
+                if (verifying_tree) {
+                    std::vector<int32_t> path{0};
+                    std::vector<int32_t> sampled_rows;
+                    for (;;) {
+                        const int32_t node = path.back();
+                        const int32_t row = spec_i_batch.at(node);
+                        const llama_pos position = batch.view.tokens.at(spec_i_batch.front()).pos[0] + int32_t(path.size() - 1);
+                        const llama_token draw = common_sampler_sample_tree(slot.smpl.get(), slot.ctx_tgt, row, position);
+                        common_sampler_accept(slot.smpl.get(), draw, true);
+                        accepted.push_back(draw);
+                        sampled_rows.push_back(row);
+                        size_t child = 1;
+                        for (; child < slot.tree_parents.size(); ++child) {
+                            if (slot.tree_parents[child] == node && slot.spec_draft[child - 1] == draw) {
+                                break;
+                            }
+                        }
+                        if (child == slot.tree_parents.size() || llama_vocab_is_eog(llama_model_get_vocab(model_tgt), draw)) {
+                            break;
+                        }
+                        path.push_back(static_cast<int32_t>(child));
+                    }
+                    if (llama_tree_commit(ctx_tgt, path.back()) != 0 ||
+                            !common_speculative_commit_tree(spec.get(), slot.id, path, accepted.back(), slot.task->params.sampling.top_p)) {
+                        throw std::runtime_error("failed to commit the verified TreeFlash path");
+                    }
+                    spec_i_batch = std::move(sampled_rows);
+                    slot.tree_parents.clear();
+                } else if (!synth_probs.empty()) {
                     // synthetic acceptance replaces verification entirely, so it comes first
                     accepted = server_sample_and_accept_synth(
                             slot.smpl.get(), slot.ctx_tgt, spec_i_batch, slot.spec_draft,
@@ -4908,9 +4956,9 @@ private:
                 const uint32_t n_rollback = slot.spec_draft.size() + 1 - accepted.size();
 
                 // the recurrent snapshots are only guaranteed for batches of up to n_rs_seq + 1 tokens, so a longer draft uses its checkpoint
-                const bool use_ckpt_tgt =
-                    ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
-                    (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_draft > llama_n_rs_seq(ctx_tgt));
+                const bool use_ckpt_tgt = !verifying_tree &&
+                    (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
+                     (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_draft > llama_n_rs_seq(ctx_tgt)));
 
                 // check for partial draft acceptance
                 if (n_rollback > 0) {

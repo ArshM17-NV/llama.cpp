@@ -35,6 +35,7 @@ struct llama_cparams {
     bool embeddings;
     bool embeddings_nextn;        // also extract the hidden state before the final output norm
     bool embeddings_nextn_masked; // extract for only rows where batch.logits != 0
+    int32_t draft_shortlist = 0;  // LiLiCorr draft output: candidate IDs and log probabilities in the anchor row
     bool causal_attn;
     bool offload_kqv;
     bool flash_attn;

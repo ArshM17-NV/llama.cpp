@@ -163,6 +163,35 @@ See:
 
 - #30506
 
+### TreeFlash with a LiLiCorr draft
+
+TreeFlash uses the LiLiCorr draft backbone and a separately trained, target-specific
+head. At each step the backbone proposes twenty candidates at each of seven future
+positions. The head chooses seven tokens and their parent links. For example, it can
+use two verifier rows for competing first tokens and spend the remaining rows on
+their likely continuations. The target processes the current token and all seven
+candidates in one forward pass. Each candidate sees only its ancestors. The server
+keeps the branch that matches the target's sampled tokens and commits its attention
+cache and recurrent state.
+
+Convert a compatible depth-seven TreeFlash checkpoint once with the exact target GGUF
+that will be served. Conversion projects its token embeddings into the head's feature
+space. It requires PyTorch, NumPy and the repository's `gguf-py` dependencies.
+
+```bash
+python convert_treeflash_to_gguf.py --head head.pt --target target.gguf --outfile tree-head.gguf
+llama-server -m target.gguf -md LiLiCorr.gguf --spec-type draft-lilicorr \
+    --spec-draft-n-max 7 --spec-tree-head tree-head.gguf --parallel 1 -fa on --jinja
+```
+
+This path supports one server slot, a compatible eight-row LiLiCorr draft and a
+hybrid target with recurrent snapshots. Set the microbatch size to at least eight.
+At temperature 1 with the standard distribution sampler the proposer and target
+share position- and token-specific Gumbel noise. This helps the tree cover likely
+stochastic continuations. A fixed seed can produce different text from the stock
+sampler. At other temperatures the target uses its usual sampler. To benchmark
+the stock LiLiCorr chain, use the same server command and omit `--spec-tree-head`.
+
 ### n-gram Cache (`ngram-cache`)
 
 An n-gram is a sequence of n tokens. The n-gram cache implementation maintains statistics about short n-gram sequences.

@@ -122,6 +122,7 @@ struct llama_context {
 
     void set_embeddings (bool value);
     void set_embeddings_nextn(bool value, bool masked);
+    bool set_draft_shortlist(int32_t top_k);
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
     void set_embeddings_layer_inp_dev(bool value);
 
@@ -161,7 +162,9 @@ struct llama_context {
                        ggml_status & ret);
 
     int encode(const llama_batch_ext & batch_inp);
-    int decode(const llama_batch_ext & batch_inp);
+    int decode(const llama_batch_ext & batch_inp, const std::shared_ptr<const llama_tree_batch> & tree = nullptr);
+    int decode_tree(const llama_batch_ext & batch, const int32_t * parents);
+    int commit_tree(int accepted);
 
     // compat version
     int encode(const llama_batch & batch_inp);
@@ -241,6 +244,7 @@ struct llama_context {
             int64_t                          t_loop_start);
 
 private:
+    std::shared_ptr<const llama_tree_batch> pending_tree;
     //
     // output
     //

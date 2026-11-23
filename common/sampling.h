@@ -67,6 +67,11 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl);
 //
 llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first = false);
 
+// A position-keyed categorical draw lets a tree proposer reuse the verifier's random priorities.
+bool common_sampler_can_hedge_tree(const common_sampler * smpl);
+float common_tree_gumbel(uint32_t seed, llama_pos position, llama_token token);
+llama_token common_sampler_sample_tree(common_sampler * smpl, llama_context * ctx, int row, llama_pos position);
+
 // generalized version of common_sampler_sample
 //
 // will cross-reference the sampled tokens with a batch of draft tokens and accept those that match

@@ -435,6 +435,8 @@ extern "C" {
 
         GGML_OP_SIGMOID_BACK,
 
+        GGML_OP_SSM_SCAN_TREE,
+
         GGML_OP_COUNT,
     };
 
@@ -2316,6 +2318,13 @@ extern "C" {
             struct ggml_tensor  * C,
             struct ggml_tensor  * ids,
             int64_t               K);
+
+    // Mamba-2 scan over a topologically ordered tree on one sequence. Each node
+    // has a snapshot in reverse node order, as in the ordinary rollback scan.
+    GGML_API struct ggml_tensor * ggml_ssm_scan_tree(
+            struct ggml_context * ctx, struct ggml_tensor * s, struct ggml_tensor * x,
+            struct ggml_tensor * dt, struct ggml_tensor * A, struct ggml_tensor * B,
+            struct ggml_tensor * C, struct ggml_tensor * ids, struct ggml_tensor * parents);
 
     // partition into non-overlapping windows with padding if needed
     // example:

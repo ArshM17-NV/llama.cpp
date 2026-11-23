@@ -487,10 +487,113 @@ struct case_shared_seq_reserve : ctx_test {
     }
 };
 
+struct case_tree_verify : ctx_test {
+    test_group group() const override { return TEST_GROUP_RS; }
+    bool uses_fill() const override { return false; } // explicitly exercises both fresh and reused states below
+    const char * name() const override { return "tree-verify"; }
+    const char * description() const override { return "compare every tree node and its committed suffix to independent chains"; }
+    std::string skip_reason(model_run & mr) const override {
+        char arch[80] = {};
+        llama_model_meta_val_str(mr.model, "general.architecture", arch, sizeof(arch));
+        return std::string(arch) == "nemotron_h" || std::string(arch) == "nemotron_h_moe" ? "" : "requires Nemotron-H";
+    }
+    case_result run(model_run & mr) const override {
+        const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(mr.model));
+        ctx_opts opts;
+        opts.n_ctx = 64;
+        opts.n_batch = opts.n_ubatch = 16;
+        opts.n_seq_max = 1;
+        opts.n_rs_seq = 7;
+        auto tree = mr.ctx(opts);
+        auto serial = mr.ctx(opts);
+        CTX_REQUIRE(tree && serial, "context initialization failed");
+
+        // Includes siblings with different subtrees and noncontiguous accepted paths.
+        const int parents[][8] = {{-1,0,1,0,3,2,3,5}, {-1,0,0,2,1,2,4,6}};
+        for (const auto & parent : parents) {
+            for (int accepted = 0; accepted < 8; ++accepted) {
+                llama_memory_clear(llama_get_memory(tree.get()), true);
+                llama_memory_clear(llama_get_memory(serial.get()), true);
+                const int prefix = 5;
+                CTX_REQUIRE(decode_gen(tree.get(), n_vocab, 0, 0, prefix), "tree prefill failed");
+                CTX_REQUIRE(decode_gen(serial.get(), n_vocab, 0, 0, prefix), "chain prefill failed");
+                common_batch batch(tree.get());
+                for (int i = 0; i < 8; ++i) {
+                    batch.add(gen_token(n_vocab, 0, prefix+i), prefix+i, 0, true);
+                }
+                CTX_REQUIRE(llama_decode_tree(tree.get(), batch.get(), parent) == 0, "tree decode failed");
+                std::vector<int> path;
+                for (int i = accepted; i >= 0; i = parent[i]) {
+                    path.push_back(i);
+                }
+                int position = prefix;
+                for (auto it = path.rbegin(); it != path.rend(); ++it) {
+                    CTX_REQUIRE(decode_one(serial.get(), gen_token(n_vocab, 0, prefix+*it), position++), "chain decode failed");
+                }
+                auto compare = [&](int node) {
+                    return compare_logits(llama_get_logits_ith(serial.get(), -1),
+                                         llama_get_logits_ith(tree.get(), node), n_vocab).nmse() <= NMSE_THRESHOLD;
+                };
+                CTX_REQUIRE(compare(accepted), "tree logits differ at node " + std::to_string(accepted));
+                CTX_REQUIRE(llama_tree_commit(tree.get(), accepted) == 0, "tree commit failed");
+                CTX_REQUIRE(llama_memory_seq_pos_max(llama_get_memory(tree.get()), 0) == position-1, "wrong committed position");
+                // The server trims speculation after the verifier commits. It must
+                // preserve the selected nonzero recurrent plane.
+                CTX_REQUIRE(llama_memory_seq_rm(llama_get_memory(tree.get()), 0, position, -1), "tail trim failed");
+                if (accepted == 4) {
+                    std::vector<uint8_t> checkpoint(llama_state_seq_get_size(tree.get(), 0));
+                    CTX_REQUIRE(!checkpoint.empty() && llama_state_seq_get_data(tree.get(), checkpoint.data(),
+                                checkpoint.size(), 0) == checkpoint.size(), "checkpoint write failed");
+                    llama_memory_clear(llama_get_memory(tree.get()), true);
+                    CTX_REQUIRE(llama_state_seq_set_data(tree.get(), checkpoint.data(), checkpoint.size(), 0) ==
+                                checkpoint.size(), "checkpoint restore failed");
+                }
+                for (int i = 0; i < 3; ++i) {
+                    const auto token = gen_token(n_vocab, 0, 20+i);
+                    CTX_REQUIRE(decode_one(tree.get(), token, position) && decode_one(serial.get(), token, position),
+                                "post-commit decode failed");
+                    CTX_REQUIRE(compare(-1), "post-commit logits differ at node " + std::to_string(accepted));
+                    ++position;
+                }
+            }
+        }
+
+        // Consecutive tree forwards reuse a graph while changing its parent table.
+        // Also alternate with a truncated tree and a chain, as near a request limit.
+        const std::vector<std::vector<int32_t>> rounds = {
+            {-1,0,1,0,3,2,3,5}, {-1,0,0,2,1,2,4,6}, {-1,0,1,1,0},
+            {-1,0,1,2}, {-1,0,0}, {-1},
+        };
+        llama_memory_clear(llama_get_memory(tree.get()), true);
+        llama_memory_clear(llama_get_memory(serial.get()), true);
+        int position = 0;
+        for (const auto & parent : rounds) {
+            common_batch batch(tree.get());
+            for (int node = 0; node < (int) parent.size(); ++node) {
+                batch.add(gen_token(n_vocab, 0, position+node), position+node, 0, true);
+            }
+            CTX_REQUIRE(llama_decode_tree(tree.get(), batch.get(), parent.data()) == 0, "consecutive tree decode failed");
+            int accepted = (int) parent.size() / 2;
+            std::vector<llama_token> path;
+            for (int node = accepted; node >= 0; node = parent[node]) {
+                path.push_back(gen_token(n_vocab, 0, position+node));
+            }
+            for (auto it = path.rbegin(); it != path.rend(); ++it) {
+                CTX_REQUIRE(decode_one(serial.get(), *it, position++), "consecutive serial decode failed");
+            }
+            CTX_REQUIRE(compare_logits(llama_get_logits_ith(serial.get(), -1), llama_get_logits_ith(tree.get(), accepted),
+                        n_vocab).nmse() <= NMSE_THRESHOLD, "consecutive tree logits differ");
+            CTX_REQUIRE(llama_tree_commit(tree.get(), accepted) == 0, "consecutive tree commit failed");
+        }
+        return case_result::pass();
+    }
+};
+
 std::vector<ctx_test_ptr> make_rs_cases() {
     std::vector<ctx_test_ptr> cases;
 
     cases.push_back(std::make_unique<case_rollback>());
+    cases.push_back(std::make_unique<case_tree_verify>());
     cases.push_back(std::make_unique<case_rollback_bound>());
     cases.push_back(std::make_unique<case_multi_seq_split_replay>());
     cases.push_back(std::make_unique<case_shared_seq_reserve>());

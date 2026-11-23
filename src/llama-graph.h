@@ -317,6 +317,9 @@ public:
     bool can_reuse(const llm_graph_params & params) override;
 
     ggml_tensor * s_copy;  // I32 [n_rs]
+    ggml_tensor * tree_parents = nullptr;
+    ggml_tensor * tree_conv_rows = nullptr;
+    ggml_tensor * tree_snapshot_rows = nullptr;
 
     // views of s_copy, computed once per graph
     // and shared across layers which use build_rs
@@ -893,6 +896,7 @@ struct llm_graph_params {
     bool allow_reuse(const llm_graph_params & other) const {
         // first check the ubatch
         bool can_reuse_ubatch =
+            bool(ubatch.tree)   == bool(other.ubatch.tree) &&
             ubatch.equal_seqs() == other.ubatch.equal_seqs() &&
             ubatch.n_tokens     == other.ubatch.n_tokens &&
             ubatch.n_seq_tokens == other.ubatch.n_seq_tokens &&
@@ -956,6 +960,7 @@ struct llm_graph_params {
             cparams.embeddings              == other.cparams.embeddings              &&
             cparams.embeddings_nextn        == other.cparams.embeddings_nextn        &&
             cparams.embeddings_nextn_masked == other.cparams.embeddings_nextn_masked &&
+            cparams.draft_shortlist         == other.cparams.draft_shortlist         &&
             cparams.causal_attn             == other.cparams.causal_attn             &&
             layer_inp_dev == other.layer_inp_dev &&
             layer_inp_src == other.layer_inp_src &&
